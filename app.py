@@ -8,6 +8,8 @@ import streamlit as st
 st.set_page_config(page_title="Mi Negocio | Dashboard Comercial", page_icon="📊", layout="wide")
 
 EXCLUDED_SELLER_CODES = {"11", "98", "1000"}
+DATA_DIR = Path("data")
+SAVED_EXCEL = DATA_DIR / "ultimo_reporte.xlsx"
 
 REQUIRED = [
     "Vendedor Codigo-Nombre", "Cliente Codigo Nombre", "Universo",
@@ -49,6 +51,31 @@ def load_excel(file_bytes: bytes) -> pd.DataFrame:
     df["Vendedor Codigo-Nombre"] = df["Vendedor Codigo-Nombre"].fillna("Sin vendedor").astype(str).str.strip()
     df["Cliente Codigo Nombre"] = df["Cliente Codigo Nombre"].fillna("Sin nombre").astype(str).str.strip()
     return df
+
+
+def save_excel(file_bytes: bytes) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    SAVED_EXCEL.write_bytes(file_bytes)
+
+
+def get_active_excel(uploaded) -> tuple[bytes | None, str | None]:
+    if uploaded is not None:
+        file_bytes = uploaded.getvalue()
+        save_excel(file_bytes)
+        st.session_state["excel_bytes"] = file_bytes
+        st.session_state["excel_name"] = uploaded.name
+        return file_bytes, uploaded.name
+
+    if "excel_bytes" in st.session_state:
+        return st.session_state["excel_bytes"], st.session_state.get("excel_name", SAVED_EXCEL.name)
+
+    if SAVED_EXCEL.exists():
+        file_bytes = SAVED_EXCEL.read_bytes()
+        st.session_state["excel_bytes"] = file_bytes
+        st.session_state["excel_name"] = SAVED_EXCEL.name
+        return file_bytes, SAVED_EXCEL.name
+
+    return None, None
 
 
 def flag_count(df: pd.DataFrame, col: str) -> int:
@@ -124,15 +151,26 @@ st.caption("Mural Corp · Seguimiento de registrados, activos, Full Digital y ve
 
 with st.sidebar:
     st.header("Carga y filtros")
-    uploaded = st.file_uploader("Cargar Excel actualizado", type=["xlsx", "xls"], help="Podés cargar el archivo nuevo cada día sin cambiar el dashboard.")
+    uploaded = st.file_uploader(
+        "Cargar o reemplazar Excel",
+        type=["xlsx", "xls"],
+        help="El último archivo queda activo hasta que cargues uno nuevo.",
+    )
     st.markdown("<div class='small-note'>El archivo debe conservar los nombres de columnas del reporte actual.</div>", unsafe_allow_html=True)
 
-if uploaded is None:
-    st.info("👈 Cargá el Excel actualizado desde el panel lateral para visualizar el dashboard.")
+file_bytes, active_name = get_active_excel(uploaded)
+
+with st.sidebar:
+    if file_bytes is not None:
+        st.success(f"Archivo activo: {active_name}")
+        st.caption("Se seguirá usando este archivo hasta que cargues uno nuevo.")
+
+if file_bytes is None:
+    st.info("👈 Cargá un Excel desde el panel lateral. Luego quedará activo hasta que sea reemplazado.")
     st.stop()
 
 try:
-    df = load_excel(uploaded.getvalue())
+    df = load_excel(file_bytes)
 except Exception as e:
     st.error(f"No pude procesar el archivo: {e}")
     st.stop()
@@ -279,4 +317,4 @@ st.download_button("Descargar oportunidades en Excel", export, file_name="seguim
 with st.expander("Ver datos procesados"):
     st.dataframe(filtered, use_container_width=True, hide_index=True)
 
-st.caption("Dashboard preparado para reemplazar el Excel diariamente. Próximo paso posible: guardar históricos diarios y automatizar la lectura desde Gescom/GescomWeb.")
+st.caption("El último Excel cargado queda activo hasta ser reemplazado. En Streamlit Community Cloud, el almacenamiento local puede reiniciarse si la app se reinicia o redepliega; para persistencia permanente conviene usar una base o almacenamiento externo.")
