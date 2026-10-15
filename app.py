@@ -1,4 +1,6 @@
+import hashlib
 import io
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -9,10 +11,16 @@ from supabase import create_client
 st.set_page_config(page_title="Mi Negocio | Dashboard Comercial", page_icon="📊", layout="wide")
 
 EXCLUDED_SELLER_CODES = {"11", "98", "1000"}
+ROUTE_DAYS = ["Lunes", "Martes", "Miercoles", "Jueves", "Viernes", "Sabado", "Domingo"]
+
 DATA_DIR = Path("data")
 SAVED_EXCEL = DATA_DIR / "ultimo_reporte.xlsx"
+SAVED_MASTER = DATA_DIR / "maestro_clientes.xlsx"
+
 SUPABASE_BUCKET = "mi-negocio"
 SUPABASE_FILE = "ultimo_reporte.xlsx"
+SUPABASE_MASTER_FILE = "maestro_clientes.xlsx"
+MASTER_TABLE = "maestro_clientes"
 
 REQUIRED = [
     "Vendedor Codigo-Nombre", "Cliente Codigo Nombre", "Universo",
@@ -26,6 +34,24 @@ NUMERIC = [
     "Sell Out (Kg)", "Sell Out (u)", "Drop Size (u)", "Visitas Exitosas",
     "Visitas Exitosas MN", "Clientes MN Fully Digital",
 ]
+
+MASTER_COLUMNS = [
+    "codigo", "estado", "razon_social", "direccion", "Barrio", "telefono",
+    "localidad", "vendedor", "zona", "Lunes", "Martes", "Miercoles",
+    "Jueves", "Viernes", "Sabado", "Domingo", "frecuencia",
+]
+
+
+def clean_code(value):
+    if pd.isna(value):
+        return None
+    text = str(value).strip()
+    if not text or text.lower() == "nan":
+        return None
+    if text.endswith(".0"):
+        text = text[:-2]
+    return text
+
 
 @st.cache_data(show_spinner=False)
 def load_excel(file_bytes: bytes) -> pd.DataFrame:
@@ -53,62 +79,113 @@ def load_excel(file_bytes: bytes) -> pd.DataFrame:
 
     df["Vendedor Codigo-Nombre"] = df["Vendedor Codigo-Nombre"].fillna("Sin vendedor").astype(str).str.strip()
     df["Cliente Codigo Nombre"] = df["Cliente Codigo Nombre"].fillna("Sin nombre").astype(str).str.strip()
+    df["ClienteCodigo"] = pd.to_numeric(
+        df["Cliente Codigo Nombre"].astype(str).str.extract(r"^\s*(\d+)", expand=False),
+        errors="coerce",
+    ).astype("Int64")
+    df["VendedorCodigo"] = (
+        df["Vendedor Codigo-Nombre"]
+        .astype(str)
+        .str.extract(r"^\s*(\d+)", expand=False)
+        .map(clean_code)
+    )
     return df
+
+
+@st.cache_data(show_spinner=False)
+def parse_master_excel(file_bytes: bytes) -> pd.DataFrame:
+    raw = pd.read_excel(io.BytesIO(file_bytes), sheet_name=0)
+    raw.columns = [str(c).strip() for c in raw.columns]
+    if "codigo" not in raw.columns:
+        raw = pd.read_excel(io.BytesIO(file_bytes), sheet_name=0, header=1)
+        raw.columns = [str(c).strip() for c in raw.columns]
+
+    if "codigo" not in raw.columns:
+        raise ValueError("No se encontró la columna 'codigo' en el maestro.")
+
+    for col in MASTER_COLUMNS:
+        if col not in raw.columns:
+            raw[col] = None
+
+    master = raw[MASTER_COLUMNS].copy()
+    master["codigo"] = pd.to_numeric(master["codigo"], errors="coerce").astype("Int64")
+    master = master[master["codigo"].notna()].copy()
+    master = master.drop_duplicates(subset=["codigo"], keep="last")
+
+    master["vendedor"] = master["vendedor"].map(clean_code)
+    for day in ROUTE_DAYS:
+        master[day] = master[day].map(clean_code)
+
+    return master.reset_index(drop=True)
 
 
 def get_supabase_client():
     try:
         url = st.secrets["SUPABASE_URL"]
-        key = st.secrets["SUPABASE_KEY"]
+        key = st.secrets.get("SUPABASE_SERVICE_ROLE_KEY", st.secrets.get("SUPABASE_KEY"))
+        if not key:
+            return None
         return create_client(url, key)
     except Exception:
         return None
 
 
-def save_local_excel(file_bytes: bytes) -> None:
+def save_local(path: Path, file_bytes: bytes) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    SAVED_EXCEL.write_bytes(file_bytes)
+    path.write_bytes(file_bytes)
 
 
-def save_excel(file_bytes: bytes) -> str:
+def upload_storage(path: str, file_bytes: bytes, content_type: str) -> bool:
     client = get_supabase_client()
-    if client is not None:
-        try:
-            client.storage.from_(SUPABASE_BUCKET).upload(
-                SUPABASE_FILE,
-                file_bytes,
-                file_options={
-                    "content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    "upsert": "true",
-                },
-            )
-            save_local_excel(file_bytes)
-            return "Supabase Storage"
-        except Exception as e:
-            st.sidebar.warning(f"No se pudo guardar en Supabase: {e}")
-
-    save_local_excel(file_bytes)
-    return "almacenamiento local"
+    if client is None:
+        return False
+    try:
+        client.storage.from_(SUPABASE_BUCKET).upload(
+            path,
+            file_bytes,
+            file_options={"content-type": content_type, "upsert": "true"},
+        )
+        return True
+    except Exception as e:
+        st.sidebar.warning(f"No se pudo guardar {path} en Supabase Storage: {e}")
+        return False
 
 
-def load_from_supabase() -> bytes | None:
+def download_storage(path: str) -> bytes | None:
     client = get_supabase_client()
     if client is None:
         return None
     try:
-        return client.storage.from_(SUPABASE_BUCKET).download(SUPABASE_FILE)
+        return client.storage.from_(SUPABASE_BUCKET).download(path)
     except Exception:
         return None
+
+
+def save_daily_excel(file_bytes: bytes) -> str:
+    saved_cloud = upload_storage(
+        SUPABASE_FILE,
+        file_bytes,
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+    save_local(SAVED_EXCEL, file_bytes)
+    return "Supabase Storage" if saved_cloud else "almacenamiento local"
 
 
 def get_active_excel(uploaded) -> tuple[bytes | None, str | None, str | None]:
     if uploaded is not None:
         file_bytes = uploaded.getvalue()
-        source = save_excel(file_bytes)
-        st.session_state["excel_bytes"] = file_bytes
-        st.session_state["excel_name"] = uploaded.name
-        st.session_state["excel_source"] = source
-        return file_bytes, uploaded.name, source
+        digest = hashlib.sha256(file_bytes).hexdigest()
+        if st.session_state.get("daily_upload_hash") != digest:
+            source = save_daily_excel(file_bytes)
+            st.session_state["daily_upload_hash"] = digest
+            st.session_state["excel_bytes"] = file_bytes
+            st.session_state["excel_name"] = uploaded.name
+            st.session_state["excel_source"] = source
+        return (
+            st.session_state["excel_bytes"],
+            st.session_state["excel_name"],
+            st.session_state["excel_source"],
+        )
 
     if "excel_bytes" in st.session_state:
         return (
@@ -117,9 +194,9 @@ def get_active_excel(uploaded) -> tuple[bytes | None, str | None, str | None]:
             st.session_state.get("excel_source", "sesión actual"),
         )
 
-    supabase_bytes = load_from_supabase()
+    supabase_bytes = download_storage(SUPABASE_FILE)
     if supabase_bytes:
-        save_local_excel(supabase_bytes)
+        save_local(SAVED_EXCEL, supabase_bytes)
         st.session_state["excel_bytes"] = supabase_bytes
         st.session_state["excel_name"] = SUPABASE_FILE
         st.session_state["excel_source"] = "Supabase Storage"
@@ -133,6 +210,256 @@ def get_active_excel(uploaded) -> tuple[bytes | None, str | None, str | None]:
         return file_bytes, SAVED_EXCEL.name, "almacenamiento local"
 
     return None, None, None
+
+
+def master_to_records(master: pd.DataFrame) -> list[dict]:
+    data = master.copy()
+    data = data.rename(columns={"Barrio": "barrio"})
+    now = datetime.now(timezone.utc).isoformat()
+    records = []
+    for row in data.itertuples(index=False):
+        item = row._asdict()
+        item["codigo"] = int(item["codigo"])
+        item["updated_at"] = now
+        clean = {}
+        for key, value in item.items():
+            if pd.isna(value):
+                clean[key] = None
+            else:
+                clean[key] = str(value) if key != "codigo" else value
+        records.append(clean)
+    return records
+
+
+def save_master_db(master: pd.DataFrame) -> bool:
+    client = get_supabase_client()
+    if client is None:
+        return False
+    try:
+        records = master_to_records(master)
+        for start in range(0, len(records), 500):
+            client.table(MASTER_TABLE).upsert(
+                records[start:start + 500],
+                on_conflict="codigo",
+            ).execute()
+        return True
+    except Exception as e:
+        st.sidebar.warning(f"No se pudo guardar el maestro en la base de datos: {e}")
+        return False
+
+
+def load_master_db() -> pd.DataFrame | None:
+    client = get_supabase_client()
+    if client is None:
+        return None
+    try:
+        rows = []
+        start = 0
+        page_size = 1000
+        while True:
+            response = (
+                client.table(MASTER_TABLE)
+                .select("*")
+                .range(start, start + page_size - 1)
+                .execute()
+            )
+            page = response.data or []
+            rows.extend(page)
+            if len(page) < page_size:
+                break
+            start += page_size
+        if not rows:
+            return None
+        master = pd.DataFrame(rows)
+        master = master.rename(columns={"barrio": "Barrio"})
+        for col in MASTER_COLUMNS:
+            if col not in master.columns:
+                master[col] = None
+        master = master[MASTER_COLUMNS].copy()
+        master["codigo"] = pd.to_numeric(master["codigo"], errors="coerce").astype("Int64")
+        master["vendedor"] = master["vendedor"].map(clean_code)
+        for day in ROUTE_DAYS:
+            master[day] = master[day].map(clean_code)
+        return master
+    except Exception:
+        return None
+
+
+def save_master(master_bytes: bytes, master: pd.DataFrame) -> str:
+    db_ok = save_master_db(master)
+    storage_ok = upload_storage(
+        SUPABASE_MASTER_FILE,
+        master_bytes,
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+    save_local(SAVED_MASTER, master_bytes)
+
+    if db_ok and storage_ok:
+        return "Supabase DB + Storage"
+    if db_ok:
+        return "Supabase DB"
+    if storage_ok:
+        return "Supabase Storage (respaldo; DB pendiente)"
+    return "almacenamiento local"
+
+
+def get_active_master(uploaded) -> tuple[pd.DataFrame | None, str | None]:
+    if uploaded is not None:
+        master_bytes = uploaded.getvalue()
+        digest = hashlib.sha256(master_bytes).hexdigest()
+        if st.session_state.get("master_upload_hash") != digest:
+            master = parse_master_excel(master_bytes)
+            source = save_master(master_bytes, master)
+            st.session_state["master_upload_hash"] = digest
+            st.session_state["master_df"] = master
+            st.session_state["master_source"] = source
+        return st.session_state["master_df"], st.session_state["master_source"]
+
+    if "master_df" in st.session_state:
+        return st.session_state["master_df"], st.session_state.get("master_source", "sesión actual")
+
+    master_db = load_master_db()
+    if master_db is not None and not master_db.empty:
+        st.session_state["master_df"] = master_db
+        st.session_state["master_source"] = "Supabase DB"
+        return master_db, "Supabase DB"
+
+    master_bytes = download_storage(SUPABASE_MASTER_FILE)
+    if master_bytes:
+        try:
+            master = parse_master_excel(master_bytes)
+            save_local(SAVED_MASTER, master_bytes)
+            st.session_state["master_df"] = master
+            st.session_state["master_source"] = "Supabase Storage"
+            return master, "Supabase Storage"
+        except Exception:
+            pass
+
+    if SAVED_MASTER.exists():
+        try:
+            master = parse_master_excel(SAVED_MASTER.read_bytes())
+            st.session_state["master_df"] = master
+            st.session_state["master_source"] = "almacenamiento local"
+            return master, "almacenamiento local"
+        except Exception:
+            pass
+
+    return None, None
+
+
+def master_to_routes(master: pd.DataFrame) -> pd.DataFrame:
+    cols = ["codigo", "razon_social", "direccion", "localidad", "zona"] + ROUTE_DAYS
+    base = master[cols].copy()
+    routes = base.melt(
+        id_vars=["codigo", "razon_social", "direccion", "localidad", "zona"],
+        value_vars=ROUTE_DAYS,
+        var_name="DiaRuta",
+        value_name="VendedorCodigo",
+    )
+    routes["VendedorCodigo"] = routes["VendedorCodigo"].map(clean_code)
+    routes = routes[routes["VendedorCodigo"].notna()].copy()
+    routes = routes[~routes["VendedorCodigo"].isin(EXCLUDED_SELLER_CODES)].copy()
+    routes["ClienteCodigo"] = pd.to_numeric(routes["codigo"], errors="coerce").astype("Int64")
+    routes["DiaRuta"] = pd.Categorical(routes["DiaRuta"], categories=ROUTE_DAYS, ordered=True)
+    return routes
+
+
+def build_opportunities(report: pd.DataFrame, master: pd.DataFrame) -> pd.DataFrame:
+    routes = master_to_routes(master)
+    report_cols = [
+        "ClienteCodigo", "Cliente Codigo Nombre", "Vendedor Codigo-Nombre",
+        "Clientes MN Registrados", "Clientes Mi Negocio Activos",
+        "Clientes MN Fully Digital", "Sell Out ($)", "Sell Out ($) Mi Negocio",
+    ]
+    merged = routes.merge(report[report_cols], on="ClienteCodigo", how="inner")
+
+    merged["Oportunidad Registro"] = merged["Clientes MN Registrados"] <= 0
+    merged["Oportunidad Activo"] = (
+        (merged["Clientes MN Registrados"] > 0)
+        & (merged["Clientes Mi Negocio Activos"] <= 0)
+    )
+    merged["Oportunidad Full Digital"] = (
+        (merged["Clientes Mi Negocio Activos"] > 0)
+        & (merged["Clientes MN Fully Digital"] <= 0)
+    )
+    merged["Oportunidad Sell Out Digital"] = (
+        (merged["Clientes MN Fully Digital"] > 0)
+        & (merged["Sell Out ($) Mi Negocio"] <= 0)
+    )
+
+    def action(row):
+        if row["Oportunidad Registro"]:
+            return "Registrar"
+        if row["Oportunidad Activo"]:
+            return "Activar"
+        if row["Oportunidad Full Digital"]:
+            return "Full Digital"
+        if row["Oportunidad Sell Out Digital"]:
+            return "Generar Sell Out Digital"
+        return None
+
+    merged["Accion"] = merged.apply(action, axis=1)
+    merged = merged[merged["Accion"].notna()].copy()
+
+    seller_names = (
+        report[["VendedorCodigo", "Vendedor Codigo-Nombre"]]
+        .dropna()
+        .drop_duplicates(subset=["VendedorCodigo"])
+        .set_index("VendedorCodigo")["Vendedor Codigo-Nombre"]
+        .to_dict()
+    )
+    merged["Vendedor"] = merged["VendedorCodigo"].map(seller_names).fillna(merged["VendedorCodigo"])
+    merged["Cliente"] = merged["Cliente Codigo Nombre"].fillna(
+        merged["ClienteCodigo"].astype("string") + " - " + merged["razon_social"].fillna("")
+    )
+    merged["Registrado"] = merged["Clientes MN Registrados"].apply(lambda v: "Sí" if v > 0 else "No")
+    merged["Activo"] = merged["Clientes Mi Negocio Activos"].apply(lambda v: "Sí" if v > 0 else "No")
+    merged["Full Digital"] = merged["Clientes MN Fully Digital"].apply(lambda v: "Sí" if v > 0 else "No")
+
+    out = merged[
+        [
+            "VendedorCodigo", "Vendedor", "DiaRuta", "ClienteCodigo", "Cliente",
+            "razon_social", "direccion", "localidad", "zona",
+            "Registrado", "Activo", "Full Digital",
+            "Sell Out ($)", "Sell Out ($) Mi Negocio", "Accion",
+        ]
+    ].copy()
+    out = out.rename(columns={
+        "VendedorCodigo": "Código vendedor",
+        "DiaRuta": "Día de ruta",
+        "ClienteCodigo": "Código cliente",
+        "razon_social": "Razón social",
+        "direccion": "Dirección",
+        "localidad": "Localidad",
+        "zona": "Zona",
+        "Sell Out ($)": "Venta acumulada",
+        "Sell Out ($) Mi Negocio": "Sell Out Digital",
+    })
+    out = out.sort_values(["Código vendedor", "Día de ruta", "Accion", "Código cliente"])
+    return out
+
+
+def build_route_summary(opps: pd.DataFrame) -> pd.DataFrame:
+    if opps.empty:
+        return pd.DataFrame(columns=[
+            "Código vendedor", "Vendedor", "Día de ruta",
+            "Registrar", "Activar", "Full Digital", "Sell Out Digital", "Total",
+        ])
+
+    grouped = (
+        opps.groupby(["Código vendedor", "Vendedor", "Día de ruta", "Accion"], observed=False)
+        .size()
+        .unstack(fill_value=0)
+        .reset_index()
+    )
+    grouped = grouped.rename(columns={"Generar Sell Out Digital": "Sell Out Digital"})
+    for col in ["Registrar", "Activar", "Full Digital", "Sell Out Digital"]:
+        if col not in grouped.columns:
+            grouped[col] = 0
+    grouped["Total"] = grouped[["Registrar", "Activar", "Full Digital", "Sell Out Digital"]].sum(axis=1)
+    return grouped[
+        ["Código vendedor", "Vendedor", "Día de ruta", "Registrar", "Activar", "Full Digital", "Sell Out Digital", "Total"]
+    ].sort_values(["Código vendedor", "Día de ruta"])
 
 
 def flag_count(df: pd.DataFrame, col: str) -> int:
@@ -176,11 +503,17 @@ def vendedor_summary(df: pd.DataFrame) -> pd.DataFrame:
             "Full Digital": m["full"],
             "% Venta digital": m["pct_digital"],
         })
+    if not rows:
+        return pd.DataFrame()
     return pd.DataFrame(rows).sort_values(["% Registrados", "Registrados"], ascending=[False, False])
 
 
 def fmt_money(v: float) -> str:
     return "$ " + f"{v:,.0f}".replace(",", ".")
+
+
+def estado(valor: float) -> str:
+    return "✅ Sí" if valor > 0 else "❌ No"
 
 
 def to_excel_bytes(sheets: dict[str, pd.DataFrame]) -> bytes:
@@ -191,8 +524,18 @@ def to_excel_bytes(sheets: dict[str, pd.DataFrame]) -> bytes:
     return output.getvalue()
 
 
-def estado(valor: float) -> str:
-    return "✅ Sí" if valor > 0 else "❌ No"
+def opportunities_excel(opps: pd.DataFrame) -> bytes:
+    summary = build_route_summary(opps)
+    sheets = {
+        "Resumen Ruta": summary,
+        "Detalle oportunidades": opps,
+    }
+
+    for seller_code, seller_df in opps.groupby("Código vendedor", dropna=False):
+        safe_code = str(seller_code)[:20]
+        sheets[f"Vendedor {safe_code}"] = seller_df.sort_values(["Día de ruta", "Accion", "Código cliente"])
+
+    return to_excel_bytes(sheets)
 
 
 st.markdown("""
@@ -207,37 +550,56 @@ st.title("📊 Mi Negocio · Dashboard Comercial")
 st.caption("Mural Corp · Seguimiento de registrados, activos, Full Digital y venta digital")
 
 with st.sidebar:
-    st.header("Carga y filtros")
+    st.header("Datos")
     uploaded = st.file_uploader(
-        "Cargar o reemplazar Excel",
+        "Cargar o reemplazar reporte Mi Negocio",
         type=["xlsx", "xls"],
-        help="El último archivo se guarda en Supabase y queda activo hasta que cargues uno nuevo.",
+        help="El último archivo queda guardado hasta que cargues uno nuevo.",
     )
-    st.markdown("<div class='small-note'>El archivo debe conservar los nombres de columnas del reporte actual.</div>", unsafe_allow_html=True)
+    master_uploaded = st.file_uploader(
+        "Cargar o actualizar maestro de clientes",
+        type=["xlsx", "xls"],
+        key="master_uploader",
+        help="Se usa para asignar cada oportunidad al vendedor y al día de ruta.",
+    )
 
 file_bytes, active_name, active_source = get_active_excel(uploaded)
 
+try:
+    master_df, master_source = get_active_master(master_uploaded)
+except Exception as e:
+    master_df, master_source = None, None
+    st.sidebar.error(f"No pude procesar el maestro: {e}")
+
 with st.sidebar:
     if file_bytes is not None:
-        st.success(f"Archivo activo: {active_name}")
+        st.success(f"Reporte activo: {active_name}")
         st.caption(f"Origen: {active_source}")
-        st.caption("Se seguirá usando este archivo hasta que cargues uno nuevo.")
-    elif get_supabase_client() is None:
-        st.info("Para persistencia permanente configurá SUPABASE_URL y SUPABASE_KEY en Streamlit Secrets.")
+    if master_df is not None:
+        st.success(f"Maestro activo: {len(master_df):,} clientes".replace(",", "."))
+        st.caption(f"Origen maestro: {master_source}")
+    else:
+        st.warning("Falta cargar el maestro de clientes.")
 
 if file_bytes is None:
-    st.info("👈 Cargá un Excel desde el panel lateral. Luego quedará guardado hasta que sea reemplazado.")
+    st.info("👈 Cargá el reporte Mi Negocio desde el panel lateral.")
     st.stop()
 
 try:
     df = load_excel(file_bytes)
 except Exception as e:
-    st.error(f"No pude procesar el archivo: {e}")
+    st.error(f"No pude procesar el reporte: {e}")
     st.stop()
+
+opportunities = None
+if master_df is not None and not master_df.empty:
+    opportunities = build_opportunities(df, master_df)
 
 vendedores = sorted([v for v in df["Vendedor Codigo-Nombre"].dropna().unique() if v and v.lower() != "nan"])
 with st.sidebar:
+    st.header("Filtros")
     vendedor_sel = st.selectbox("Vendedor", ["Todos"] + vendedores)
+    day_sel = st.selectbox("Día de ruta", ["Todos"] + ROUTE_DAYS)
     buscar = st.text_input("Buscar cliente", placeholder="Código o nombre")
 
 base_filtrada = df if vendedor_sel == "Todos" else df[df["Vendedor Codigo-Nombre"] == vendedor_sel]
@@ -254,13 +616,9 @@ if buscar.strip():
     else:
         estado_clientes = filtered[
             [
-                "Cliente Codigo Nombre",
-                "Vendedor Codigo-Nombre",
-                "Clientes MN Registrados",
-                "Clientes Mi Negocio Activos",
-                "Clientes MN Fully Digital",
-                "Sell Out ($)",
-                "Sell Out ($) Mi Negocio",
+                "Cliente Codigo Nombre", "Vendedor Codigo-Nombre",
+                "Clientes MN Registrados", "Clientes Mi Negocio Activos",
+                "Clientes MN Fully Digital", "Sell Out ($)", "Sell Out ($) Mi Negocio",
             ]
         ].copy()
         estado_clientes["Registrado"] = estado_clientes["Clientes MN Registrados"].apply(estado)
@@ -288,10 +646,6 @@ if buscar.strip():
                 estado_clientes[["Cliente", "Vendedor", "Registrado", "Activo", "Full Digital", "Venta acumulada", "Venta digital"]],
                 use_container_width=True,
                 hide_index=True,
-                column_config={
-                    "Venta acumulada": st.column_config.NumberColumn(format="$ %.0f"),
-                    "Venta digital": st.column_config.NumberColumn(format="$ %.0f"),
-                },
             )
         st.divider()
 
@@ -323,19 +677,74 @@ with left:
     st.plotly_chart(fig, use_container_width=True)
 
 with right:
-    ventas = pd.DataFrame({"Tipo": ["Mi Negocio", "Resto"], "Venta": [m["venta_digital"], max(m["venta_total"]-m["venta_digital"], 0)]})
+    ventas = pd.DataFrame({
+        "Tipo": ["Mi Negocio", "Resto"],
+        "Venta": [m["venta_digital"], max(m["venta_total"] - m["venta_digital"], 0)],
+    })
     fig2 = px.pie(ventas, names="Tipo", values="Venta", hole=.62, title="Participación de venta digital")
     fig2.update_layout(margin=dict(l=20, r=20, t=55, b=20), height=360)
     st.plotly_chart(fig2, use_container_width=True)
+
+if opportunities is not None:
+    st.subheader("🗺️ Oportunidades por vendedor y día de ruta")
+    opp_view = opportunities.copy()
+
+    if vendedor_sel != "Todos":
+        seller_code = clean_code(
+            pd.Series([vendedor_sel]).astype(str).str.extract(r"^\s*(\d+)", expand=False).iloc[0]
+        )
+        if seller_code:
+            opp_view = opp_view[opp_view["Código vendedor"] == seller_code]
+
+    if day_sel != "Todos":
+        opp_view = opp_view[opp_view["Día de ruta"].astype(str) == day_sel]
+
+    r1, r2, r3, r4, r5 = st.columns(5)
+    r1.metric("Registrar", int((opp_view["Accion"] == "Registrar").sum()))
+    r2.metric("Activar", int((opp_view["Accion"] == "Activar").sum()))
+    r3.metric("Full Digital", int((opp_view["Accion"] == "Full Digital").sum()))
+    r4.metric("Sell Out Digital", int((opp_view["Accion"] == "Generar Sell Out Digital").sum()))
+    r5.metric("Total oportunidades", len(opp_view))
+
+    if opp_view.empty:
+        st.info("No hay oportunidades para los filtros seleccionados.")
+    else:
+        st.dataframe(
+            opp_view,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Venta acumulada": st.column_config.NumberColumn(format="$ %.0f"),
+                "Sell Out Digital": st.column_config.NumberColumn(format="$ %.0f"),
+            },
+        )
+
+    st.subheader("Resumen por ruta")
+    st.dataframe(build_route_summary(opp_view), use_container_width=True, hide_index=True)
+
+    export_route = opportunities_excel(opportunities)
+    st.download_button(
+        "Descargar oportunidades por vendedor y ruta",
+        export_route,
+        file_name="oportunidades_por_vendedor_y_ruta.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+else:
+    st.warning("Cargá el maestro de clientes para generar oportunidades por vendedor y día de ruta.")
 
 sin_reg = filtered[(filtered["Universo"] > 0) & (filtered["Clientes MN Registrados"] <= 0)].copy()
 reg_no_act = filtered[(filtered["Clientes MN Registrados"] > 0) & (filtered["Clientes Mi Negocio Activos"] <= 0)].copy()
 act_no_full = filtered[(filtered["Clientes Mi Negocio Activos"] > 0) & (filtered["Clientes MN Fully Digital"] <= 0)].copy()
 
 show_cols = ["Vendedor Codigo-Nombre", "Cliente Codigo Nombre", "Sell Out ($)", "Sell Out ($) Mi Negocio"]
-rename = {"Vendedor Codigo-Nombre":"Vendedor", "Cliente Codigo Nombre":"Cliente", "Sell Out ($)":"Venta acumulada", "Sell Out ($) Mi Negocio":"Venta digital"}
+rename = {
+    "Vendedor Codigo-Nombre": "Vendedor",
+    "Cliente Codigo Nombre": "Cliente",
+    "Sell Out ($)": "Venta acumulada",
+    "Sell Out ($) Mi Negocio": "Venta digital",
+}
 
-st.subheader("🎯 Oportunidades por cliente")
+st.subheader("🎯 Oportunidades por estado")
 t1, t2, t3 = st.tabs([
     f"Sin registrar ({len(sin_reg)})",
     f"Registrados no activos ({len(reg_no_act)})",
@@ -344,37 +753,33 @@ t1, t2, t3 = st.tabs([
 for tab, data in [(t1, sin_reg), (t2, reg_no_act), (t3, act_no_full)]:
     with tab:
         view = data[show_cols].rename(columns=rename).copy()
-        st.dataframe(view, use_container_width=True, hide_index=True, column_config={
-            "Venta acumulada": st.column_config.NumberColumn(format="$ %.0f"),
-            "Venta digital": st.column_config.NumberColumn(format="$ %.0f"),
-        })
+        st.dataframe(view, use_container_width=True, hide_index=True)
 
 if vendedor_sel == "Todos":
     st.subheader("🏆 Ranking por vendedor")
     ranking = vendedor_summary(df)
-    st.dataframe(ranking, use_container_width=True, hide_index=True, column_config={
-        "% Registrados": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.1f%%"),
-        "% Venta digital": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.1f%%"),
-    })
-
-    chart_df = ranking.sort_values("% Registrados", ascending=True)
-    fig3 = px.bar(chart_df, x="% Registrados", y="Vendedor", orientation="h", title="Cobertura de registro por vendedor", text_auto=".1f")
-    fig3.update_layout(height=max(380, len(chart_df)*34), xaxis_range=[0, 100], margin=dict(l=20,r=20,t=55,b=20))
-    st.plotly_chart(fig3, use_container_width=True)
-else:
-    ranking = vendedor_summary(filtered)
-
-st.divider()
-st.subheader("⬇️ Exportar seguimiento")
-export = to_excel_bytes({
-    "Sin registrar": sin_reg[show_cols].rename(columns=rename),
-    "Registrados no activos": reg_no_act[show_cols].rename(columns=rename),
-    "Activos no Full Digital": act_no_full[show_cols].rename(columns=rename),
-    "Ranking vendedores": vendedor_summary(df),
-})
-st.download_button("Descargar oportunidades en Excel", export, file_name="seguimiento_mi_negocio.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    if not ranking.empty:
+        st.dataframe(ranking, use_container_width=True, hide_index=True)
+        chart_df = ranking.sort_values("% Registrados", ascending=True)
+        fig3 = px.bar(
+            chart_df,
+            x="% Registrados",
+            y="Vendedor",
+            orientation="h",
+            title="Cobertura de registro por vendedor",
+            text_auto=".1f",
+        )
+        fig3.update_layout(
+            height=max(380, len(chart_df) * 34),
+            xaxis_range=[0, 100],
+            margin=dict(l=20, r=20, t=55, b=20),
+        )
+        st.plotly_chart(fig3, use_container_width=True)
 
 with st.expander("Ver datos procesados"):
     st.dataframe(filtered, use_container_width=True, hide_index=True)
 
-st.caption("El último Excel cargado se guarda en Supabase Storage y queda activo hasta ser reemplazado. Si Supabase no está configurado, la app usa almacenamiento local como respaldo.")
+st.caption(
+    "El reporte diario se guarda en Supabase Storage. "
+    "El maestro de clientes se sincroniza con Supabase DB y se usa para armar las oportunidades por vendedor y día de ruta."
+)
