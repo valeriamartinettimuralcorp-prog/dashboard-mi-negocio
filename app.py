@@ -7,6 +7,8 @@ import streamlit as st
 
 st.set_page_config(page_title="Mi Negocio | Dashboard Comercial", page_icon="📊", layout="wide")
 
+EXCLUDED_SELLER_CODES = {"11", "98", "1000"}
+
 REQUIRED = [
     "Vendedor Codigo-Nombre", "Cliente Codigo Nombre", "Universo",
     "Clientes MN Registrados", "Clientes Mi Negocio Activos",
@@ -32,6 +34,17 @@ def load_excel(file_bytes: bytes) -> pd.DataFrame:
     vendedor = df["Vendedor Codigo-Nombre"].astype(str).str.strip().str.lower()
     cliente = df["Cliente Codigo Nombre"].astype(str).str.strip().str.lower()
     df = df[~vendedor.eq("total") & ~cliente.eq("total")].copy()
+
+    # Quitar del análisis vendedores internos/no comerciales por código.
+    # Se toma el código numérico al inicio de "Vendedor Codigo-Nombre"
+    # para que funcione con valores como "11 - Apellido Nombre" o simplemente "11".
+    seller_code = (
+        df["Vendedor Codigo-Nombre"]
+        .astype(str)
+        .str.strip()
+        .str.extract(r"^(\d+)", expand=False)
+    )
+    df = df[~seller_code.isin(EXCLUDED_SELLER_CODES)].copy()
 
     for col in NUMERIC:
         if col in df.columns:
