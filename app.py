@@ -4,12 +4,15 @@ from pathlib import Path
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+from supabase import create_client
 
 st.set_page_config(page_title="Mi Negocio | Dashboard Comercial", page_icon="📊", layout="wide")
 
 EXCLUDED_SELLER_CODES = {"11", "98", "1000"}
 DATA_DIR = Path("data")
 SAVED_EXCEL = DATA_DIR / "ultimo_reporte.xlsx"
+SUPABASE_BUCKET = "mi-negocio"
+SUPABASE_FILE = "ultimo_reporte.xlsx"
 
 REQUIRED = [
     "Vendedor Codigo-Nombre", "Cliente Codigo Nombre", "Universo",
@@ -53,29 +56,83 @@ def load_excel(file_bytes: bytes) -> pd.DataFrame:
     return df
 
 
-def save_excel(file_bytes: bytes) -> None:
+def get_supabase_client():
+    try:
+        url = st.secrets["SUPABASE_URL"]
+        key = st.secrets["SUPABASE_KEY"]
+        return create_client(url, key)
+    except Exception:
+        return None
+
+
+def save_local_excel(file_bytes: bytes) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     SAVED_EXCEL.write_bytes(file_bytes)
 
 
-def get_active_excel(uploaded) -> tuple[bytes | None, str | None]:
+def save_excel(file_bytes: bytes) -> str:
+    client = get_supabase_client()
+    if client is not None:
+        try:
+            client.storage.from_(SUPABASE_BUCKET).upload(
+                SUPABASE_FILE,
+                file_bytes,
+                file_options={
+                    "content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    "upsert": "true",
+                },
+            )
+            save_local_excel(file_bytes)
+            return "Supabase Storage"
+        except Exception as e:
+            st.sidebar.warning(f"No se pudo guardar en Supabase: {e}")
+
+    save_local_excel(file_bytes)
+    return "almacenamiento local"
+
+
+def load_from_supabase() -> bytes | None:
+    client = get_supabase_client()
+    if client is None:
+        return None
+    try:
+        return client.storage.from_(SUPABASE_BUCKET).download(SUPABASE_FILE)
+    except Exception:
+        return None
+
+
+def get_active_excel(uploaded) -> tuple[bytes | None, str | None, str | None]:
     if uploaded is not None:
         file_bytes = uploaded.getvalue()
-        save_excel(file_bytes)
+        source = save_excel(file_bytes)
         st.session_state["excel_bytes"] = file_bytes
         st.session_state["excel_name"] = uploaded.name
-        return file_bytes, uploaded.name
+        st.session_state["excel_source"] = source
+        return file_bytes, uploaded.name, source
 
     if "excel_bytes" in st.session_state:
-        return st.session_state["excel_bytes"], st.session_state.get("excel_name", SAVED_EXCEL.name)
+        return (
+            st.session_state["excel_bytes"],
+            st.session_state.get("excel_name", SUPABASE_FILE),
+            st.session_state.get("excel_source", "sesión actual"),
+        )
+
+    supabase_bytes = load_from_supabase()
+    if supabase_bytes:
+        save_local_excel(supabase_bytes)
+        st.session_state["excel_bytes"] = supabase_bytes
+        st.session_state["excel_name"] = SUPABASE_FILE
+        st.session_state["excel_source"] = "Supabase Storage"
+        return supabase_bytes, SUPABASE_FILE, "Supabase Storage"
 
     if SAVED_EXCEL.exists():
         file_bytes = SAVED_EXCEL.read_bytes()
         st.session_state["excel_bytes"] = file_bytes
         st.session_state["excel_name"] = SAVED_EXCEL.name
-        return file_bytes, SAVED_EXCEL.name
+        st.session_state["excel_source"] = "almacenamiento local"
+        return file_bytes, SAVED_EXCEL.name, "almacenamiento local"
 
-    return None, None
+    return None, None, None
 
 
 def flag_count(df: pd.DataFrame, col: str) -> int:
@@ -154,19 +211,22 @@ with st.sidebar:
     uploaded = st.file_uploader(
         "Cargar o reemplazar Excel",
         type=["xlsx", "xls"],
-        help="El último archivo queda activo hasta que cargues uno nuevo.",
+        help="El último archivo se guarda en Supabase y queda activo hasta que cargues uno nuevo.",
     )
     st.markdown("<div class='small-note'>El archivo debe conservar los nombres de columnas del reporte actual.</div>", unsafe_allow_html=True)
 
-file_bytes, active_name = get_active_excel(uploaded)
+file_bytes, active_name, active_source = get_active_excel(uploaded)
 
 with st.sidebar:
     if file_bytes is not None:
         st.success(f"Archivo activo: {active_name}")
+        st.caption(f"Origen: {active_source}")
         st.caption("Se seguirá usando este archivo hasta que cargues uno nuevo.")
+    elif get_supabase_client() is None:
+        st.info("Para persistencia permanente configurá SUPABASE_URL y SUPABASE_KEY en Streamlit Secrets.")
 
 if file_bytes is None:
-    st.info("👈 Cargá un Excel desde el panel lateral. Luego quedará activo hasta que sea reemplazado.")
+    st.info("👈 Cargá un Excel desde el panel lateral. Luego quedará guardado hasta que sea reemplazado.")
     st.stop()
 
 try:
@@ -317,4 +377,4 @@ st.download_button("Descargar oportunidades en Excel", export, file_name="seguim
 with st.expander("Ver datos procesados"):
     st.dataframe(filtered, use_container_width=True, hide_index=True)
 
-st.caption("El último Excel cargado queda activo hasta ser reemplazado. En Streamlit Community Cloud, el almacenamiento local puede reiniciarse si la app se reinicia o redepliega; para persistencia permanente conviene usar una base o almacenamiento externo.")
+st.caption("El último Excel cargado se guarda en Supabase Storage y queda activo hasta ser reemplazado. Si Supabase no está configurado, la app usa almacenamiento local como respaldo.")
