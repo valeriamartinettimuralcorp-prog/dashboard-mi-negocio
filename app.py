@@ -7,6 +7,8 @@ import streamlit as st
 
 st.set_page_config(page_title="Mi Negocio | Dashboard Comercial", page_icon="📊", layout="wide")
 
+EXCLUDED_SELLER_CODES = {"11", "98", "1000"}
+
 REQUIRED = [
     "Vendedor Codigo-Nombre", "Cliente Codigo Nombre", "Universo",
     "Clientes MN Registrados", "Clientes Mi Negocio Activos",
@@ -28,10 +30,17 @@ def load_excel(file_bytes: bytes) -> pd.DataFrame:
     if missing:
         raise ValueError("Faltan columnas obligatorias: " + ", ".join(missing))
 
-    # Excluir filas de totales/resúmenes para evitar doble conteo.
     vendedor = df["Vendedor Codigo-Nombre"].astype(str).str.strip().str.lower()
     cliente = df["Cliente Codigo Nombre"].astype(str).str.strip().str.lower()
     df = df[~vendedor.eq("total") & ~cliente.eq("total")].copy()
+
+    seller_code = (
+        df["Vendedor Codigo-Nombre"]
+        .astype(str)
+        .str.strip()
+        .str.extract(r"^(\d+)", expand=False)
+    )
+    df = df[~seller_code.isin(EXCLUDED_SELLER_CODES)].copy()
 
     for col in NUMERIC:
         if col in df.columns:
@@ -43,7 +52,6 @@ def load_excel(file_bytes: bytes) -> pd.DataFrame:
 
 
 def flag_count(df: pd.DataFrame, col: str) -> int:
-    # Cada fila representa un cliente; cualquier valor > 0 cuenta como alcanzado.
     return int((df[col] > 0).sum())
 
 
@@ -99,6 +107,10 @@ def to_excel_bytes(sheets: dict[str, pd.DataFrame]) -> bytes:
     return output.getvalue()
 
 
+def estado(valor: float) -> str:
+    return "✅ Sí" if valor > 0 else "❌ No"
+
+
 st.markdown("""
 <style>
 .block-container {padding-top: 1.5rem; padding-bottom: 2rem;}
@@ -130,9 +142,60 @@ with st.sidebar:
     vendedor_sel = st.selectbox("Vendedor", ["Todos"] + vendedores)
     buscar = st.text_input("Buscar cliente", placeholder="Código o nombre")
 
-filtered = df if vendedor_sel == "Todos" else df[df["Vendedor Codigo-Nombre"] == vendedor_sel]
+base_filtrada = df if vendedor_sel == "Todos" else df[df["Vendedor Codigo-Nombre"] == vendedor_sel]
+filtered = base_filtrada.copy()
+
 if buscar.strip():
-    filtered = filtered[filtered["Cliente Codigo Nombre"].str.contains(buscar.strip(), case=False, na=False)]
+    filtered = base_filtrada[
+        base_filtrada["Cliente Codigo Nombre"].str.contains(buscar.strip(), case=False, na=False)
+    ].copy()
+
+    st.subheader("🔎 Resultado de búsqueda de cliente")
+    if filtered.empty:
+        st.warning("No se encontraron clientes que coincidan con la búsqueda.")
+    else:
+        estado_clientes = filtered[
+            [
+                "Cliente Codigo Nombre",
+                "Vendedor Codigo-Nombre",
+                "Clientes MN Registrados",
+                "Clientes Mi Negocio Activos",
+                "Clientes MN Fully Digital",
+                "Sell Out ($)",
+                "Sell Out ($) Mi Negocio",
+            ]
+        ].copy()
+        estado_clientes["Registrado"] = estado_clientes["Clientes MN Registrados"].apply(estado)
+        estado_clientes["Activo"] = estado_clientes["Clientes Mi Negocio Activos"].apply(estado)
+        estado_clientes["Full Digital"] = estado_clientes["Clientes MN Fully Digital"].apply(estado)
+        estado_clientes = estado_clientes.rename(columns={
+            "Cliente Codigo Nombre": "Cliente",
+            "Vendedor Codigo-Nombre": "Vendedor",
+            "Sell Out ($)": "Venta acumulada",
+            "Sell Out ($) Mi Negocio": "Venta digital",
+        })
+
+        if len(estado_clientes) == 1:
+            row = estado_clientes.iloc[0]
+            st.markdown(f"**{row['Cliente']}** · Vendedor: {row['Vendedor']}")
+            e1, e2, e3, e4, e5 = st.columns(5)
+            e1.metric("Registrado", row["Registrado"])
+            e2.metric("Activo", row["Activo"])
+            e3.metric("Full Digital", row["Full Digital"])
+            e4.metric("Venta acumulada", fmt_money(row["Venta acumulada"]))
+            e5.metric("Venta digital", fmt_money(row["Venta digital"]))
+        else:
+            st.caption(f"Se encontraron {len(estado_clientes)} coincidencias.")
+            st.dataframe(
+                estado_clientes[["Cliente", "Vendedor", "Registrado", "Activo", "Full Digital", "Venta acumulada", "Venta digital"]],
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Venta acumulada": st.column_config.NumberColumn(format="$ %.0f"),
+                    "Venta digital": st.column_config.NumberColumn(format="$ %.0f"),
+                },
+            )
+        st.divider()
 
 m = calc_metrics(filtered)
 
@@ -151,7 +214,6 @@ c8.metric("Venta Mi Negocio", fmt_money(m["venta_digital"]))
 
 st.divider()
 
-# Embudo y venta digital
 left, right = st.columns([1, 1])
 with left:
     funnel = pd.DataFrame({
@@ -168,7 +230,6 @@ with right:
     fig2.update_layout(margin=dict(l=20, r=20, t=55, b=20), height=360)
     st.plotly_chart(fig2, use_container_width=True)
 
-# Estados de clientes
 sin_reg = filtered[(filtered["Universo"] > 0) & (filtered["Clientes MN Registrados"] <= 0)].copy()
 reg_no_act = filtered[(filtered["Clientes MN Registrados"] > 0) & (filtered["Clientes Mi Negocio Activos"] <= 0)].copy()
 act_no_full = filtered[(filtered["Clientes Mi Negocio Activos"] > 0) & (filtered["Clientes MN Fully Digital"] <= 0)].copy()
