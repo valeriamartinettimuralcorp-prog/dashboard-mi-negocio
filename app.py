@@ -423,7 +423,16 @@ def get_active_master(uploaded) -> tuple[pd.DataFrame | None, str | None]:
     return None, None
 
 
+def active_master_clients(master: pd.DataFrame) -> pd.DataFrame:
+    """Usa el estado comercial del maestro, no la actividad digital de Mi Negocio."""
+    if "estado" not in master.columns:
+        raise ValueError("El maestro debe incluir la columna 'estado' para identificar clientes activos.")
+    activos = master["estado"].map(norm).isin(["activo", "activa", "activos", "activas"])
+    return master.loc[activos].copy()
+
+
 def master_to_routes(master: pd.DataFrame) -> pd.DataFrame:
+    master = active_master_clients(master)
     cols = ["codigo", "razon_social", "direccion", "localidad", "zona"] + ROUTE_DAYS
     base = master[cols].copy()
     routes = base.melt(
@@ -645,6 +654,8 @@ file_bytes, active_name, active_source = get_active_excel(uploaded)
 
 try:
     master_df, master_source = get_active_master(master_uploaded)
+    if master_df is not None:
+        master_df = active_master_clients(master_df)
 except Exception as e:
     master_df, master_source = None, None
     st.sidebar.error(f"No pude procesar el maestro: {e}")
@@ -654,7 +665,7 @@ with st.sidebar:
         st.success(f"Reporte activo: {active_name}")
         st.caption(f"Origen: {active_source}")
     if master_df is not None:
-        st.success(f"Maestro activo: {len(master_df):,} clientes".replace(",", "."))
+        st.success(f"Maestro activo: {len(master_df):,} clientes activos".replace(",", "."))
         st.caption(f"Origen maestro: {master_source}")
     else:
         st.warning("Falta cargar el maestro de clientes.")
