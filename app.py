@@ -1,5 +1,6 @@
 import hashlib
 import io
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -42,6 +43,76 @@ MASTER_COLUMNS = [
 ]
 
 
+def to_number(series: pd.Series) -> pd.Series:
+    """Convierte a número aceptando textos tipo '$ 1.234.567,89' (formato AR) además de números reales."""
+    if pd.api.types.is_numeric_dtype(series):
+        return series.fillna(0).astype(float)
+    num = pd.to_numeric(series, errors="coerce")
+    txt = series.astype(str).str.replace(r"[^\d,.\-]", "", regex=True)
+    ar = txt.str.contains(",") | txt.str.count(r"\.").gt(1) | txt.str.match(r"^-?\d{1,3}(?:\.\d{3})+$")  # coma decimal o puntos de miles
+    txt = txt.where(~ar, txt.str.replace(".", "", regex=False).str.replace(",", ".", regex=False))
+    parsed = pd.to_numeric(txt, errors="coerce")
+    return num.where(num.notna() & ~ar, parsed).fillna(0).astype(float)
+
+
+def norm(s) -> str:
+    return unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode().lower().strip()
+
+
+def norm_code(series: pd.Series) -> pd.Series:
+    """Normaliza códigos de cliente: solo dígitos, sin '.0' ni ceros a la izquierda."""
+    s = series.astype(str).str.strip().str.replace(r"\.0+$", "", regex=True)
+    return s.str.extract(r"^\s*(\d+)")[0].str.lstrip("0")
+
+
+ROUTE_COLS = {  # columna destino -> posibles encabezados (normalizados) en las hojas de ruta
+    "Codigo": ["codigo cliente", "codigo", "cod cliente"],
+    "Dia": ["dia", "dia de visita", "dia visita"],
+    "Secuencia": ["secuencia", "orden"],
+    "Vendedor ruta": ["vendedor", "vennom"],
+    "Direccion": ["calle / direccion", "direccion", "calle"],
+    "Localidad": ["localidad"],
+    "GPS": ["geolocalizacion (gps)", "gps", "geolocalizacion"],
+}
+
+
+@st.cache_data(show_spinner=False)
+def load_rutas(files: tuple[tuple[str, bytes], ...]) -> pd.DataFrame:
+    """Lee hojas de ruta (una hoja por día o una columna 'Día') y devuelve Codigo/Dia/Secuencia/..."""
+    dias_norm = {norm(d): d for d in ROUTE_DAYS}
+    frames = []
+    for _, data in files:
+        sheets = pd.read_excel(io.BytesIO(data), sheet_name=None, header=None, dtype=object)
+        for sheet_name, raw in sheets.items():
+            hdr = None
+            for i in range(len(raw)):
+                vals = {norm(v) for v in raw.iloc[i].tolist()}
+                if vals & set(ROUTE_COLS["Codigo"]):
+                    hdr = i
+                    break
+            if hdr is None:
+                continue
+            body = raw.iloc[hdr + 1:].copy()
+            body.columns = [norm(c) for c in raw.iloc[hdr]]
+            out = pd.DataFrame(index=body.index)
+            for dest, options in ROUTE_COLS.items():
+                col = next((o for o in options if o in body.columns), None)
+                out[dest] = body[col] if col else None
+            if out["Dia"].isna().all():
+                if norm(sheet_name) not in dias_norm:
+                    continue  # sin día identificable (ni columna ni nombre de hoja)
+                out["Dia"] = dias_norm[norm(sheet_name)]
+            out["Dia"] = out["Dia"].map(lambda d: dias_norm.get(norm(d), str(d).strip()))
+            out["Codigo"] = norm_code(out["Codigo"])
+            out = out[out["Codigo"].notna() & out["Codigo"].ne("")]
+            frames.append(out)
+    if not frames:
+        return pd.DataFrame(columns=list(ROUTE_COLS))
+    rutas = pd.concat(frames, ignore_index=True)
+    rutas["Secuencia"] = pd.to_numeric(rutas["Secuencia"], errors="coerce")
+    return rutas
+
+
 def clean_code(value):
     if pd.isna(value):
         return None
@@ -63,7 +134,7 @@ def load_excel(file_bytes: bytes) -> pd.DataFrame:
 
     vendedor = df["Vendedor Codigo-Nombre"].astype(str).str.strip().str.lower()
     cliente = df["Cliente Codigo Nombre"].astype(str).str.strip().str.lower()
-    df = df[~vendedor.eq("total") & ~cliente.eq("total")].copy()
+    df = df[~vendedor.str.startswith("total") & ~cliente.str.startswith("total")].copy()
 
     seller_code = (
         df["Vendedor Codigo-Nombre"]
@@ -75,14 +146,12 @@ def load_excel(file_bytes: bytes) -> pd.DataFrame:
 
     for col in NUMERIC:
         if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+            df[col] = to_number(df[col])
 
     df["Vendedor Codigo-Nombre"] = df["Vendedor Codigo-Nombre"].fillna("Sin vendedor").astype(str).str.strip()
     df["Cliente Codigo Nombre"] = df["Cliente Codigo Nombre"].fillna("Sin nombre").astype(str).str.strip()
-    df["ClienteCodigo"] = pd.to_numeric(
-        df["Cliente Codigo Nombre"].astype(str).str.extract(r"^\s*(\d+)", expand=False),
-        errors="coerce",
-    ).astype("Int64")
+    code_src = next((c for c in df.columns if norm(c) == "cliente codigo"), "Cliente Codigo Nombre")
+    df["ClienteCodigo"] = pd.to_numeric(norm_code(df[code_src]), errors="coerce").astype("Int64")
     df["VendedorCodigo"] = (
         df["Vendedor Codigo-Nombre"]
         .astype(str)
@@ -433,7 +502,7 @@ def build_opportunities(report: pd.DataFrame, master: pd.DataFrame) -> pd.DataFr
         "localidad": "Localidad",
         "zona": "Zona",
         "Sell Out ($)": "Venta acumulada",
-        "Sell Out ($) Mi Negocio": "Sell Out Digital",
+        "Sell Out ($) Mi Negocio": "Venta acumulada MN",
     })
     out = out.sort_values(["Código vendedor", "Día de ruta", "Accion", "Código cliente"])
     return out
@@ -501,7 +570,9 @@ def vendedor_summary(df: pd.DataFrame) -> pd.DataFrame:
             "Faltan registrar": m["faltan_registrar"],
             "Activos": m["activos"],
             "Full Digital": m["full"],
-            "% Venta digital": m["pct_digital"],
+            "Venta acumulada": m["venta_total"],
+            "Venta acumulada MN": m["venta_digital"],
+            "% Avance MN": m["pct_digital"],
         })
     if not rows:
         return pd.DataFrame()
@@ -599,15 +670,37 @@ vendedores = sorted([v for v in df["Vendedor Codigo-Nombre"].dropna().unique() i
 with st.sidebar:
     st.header("Filtros")
     vendedor_sel = st.selectbox("Vendedor", ["Todos"] + vendedores)
-    day_sel = st.selectbox("Día de ruta", ["Todos"] + ROUTE_DAYS)
+    from zoneinfo import ZoneInfo
+    fecha_actual = datetime.now(ZoneInfo("America/Argentina/Buenos_Aires")).date()
+    day_default = fecha_actual.weekday()
+    day_sel = st.selectbox("Día de ruta", ["Todos"] + ROUTE_DAYS, index=1 if day_default == 6 else day_default + 1)
+    rutas_files = st.file_uploader("Hojas de ruta", type=["xlsx", "xls"], accept_multiple_files=True, help="Una hoja por día o columnas Código Cliente y Día.")
     buscar = st.text_input("Buscar cliente", placeholder="Código o nombre")
+
+ruta_dia = None
+if rutas_files:
+    try:
+        rutas = load_rutas(tuple((f.name, f.getvalue()) for f in rutas_files))
+        if rutas.empty:
+            st.sidebar.warning("No encontré códigos de cliente y días en las hojas de ruta.")
+            st.stop()
+        ruta_dia = rutas if day_sel == "Todos" else rutas[rutas["Dia"] == day_sel]
+        ruta_dia = ruta_dia.sort_values(["Vendedor ruta", "Secuencia"], na_position="last").drop_duplicates("Codigo").copy()
+        ruta_dia["ClienteCodigo"] = pd.to_numeric(ruta_dia["Codigo"], errors="coerce").astype("Int64")
+        st.sidebar.caption(f"{len(ruta_dia)} clientes en la ruta seleccionada.")
+        sin_dato = (~ruta_dia["ClienteCodigo"].isin(df["ClienteCodigo"])).sum()
+        if sin_dato:
+            st.caption(f"⚠️ {sin_dato} clientes de la ruta no aparecen en el reporte de Mi Negocio.")
+    except Exception as e:
+        st.error(f"No pude procesar las hojas de ruta: {e}")
+        st.stop()
 
 base_filtrada = df if vendedor_sel == "Todos" else df[df["Vendedor Codigo-Nombre"] == vendedor_sel]
 filtered = base_filtrada.copy()
 
 if buscar.strip():
     filtered = base_filtrada[
-        base_filtrada["Cliente Codigo Nombre"].str.contains(buscar.strip(), case=False, na=False)
+        base_filtrada["Cliente Codigo Nombre"].str.contains(buscar.strip(), case=False, na=False, regex=False)
     ].copy()
 
     st.subheader("🔎 Resultado de búsqueda de cliente")
@@ -628,7 +721,7 @@ if buscar.strip():
             "Cliente Codigo Nombre": "Cliente",
             "Vendedor Codigo-Nombre": "Vendedor",
             "Sell Out ($)": "Venta acumulada",
-            "Sell Out ($) Mi Negocio": "Venta digital",
+            "Sell Out ($) Mi Negocio": "Venta acumulada MN",
         })
 
         if len(estado_clientes) == 1:
@@ -639,11 +732,11 @@ if buscar.strip():
             e2.metric("Activo", row["Activo"])
             e3.metric("Full Digital", row["Full Digital"])
             e4.metric("Venta acumulada", fmt_money(row["Venta acumulada"]))
-            e5.metric("Venta digital", fmt_money(row["Venta digital"]))
+            e5.metric("Venta acumulada MN", fmt_money(row["Venta acumulada MN"]))
         else:
             st.caption(f"Se encontraron {len(estado_clientes)} coincidencias.")
             st.dataframe(
-                estado_clientes[["Cliente", "Vendedor", "Registrado", "Activo", "Full Digital", "Venta acumulada", "Venta digital"]],
+                estado_clientes[["Cliente", "Vendedor", "Registrado", "Activo", "Full Digital", "Venta acumulada", "Venta acumulada MN"]],
                 use_container_width=True,
                 hide_index=True,
             )
@@ -657,12 +750,12 @@ c1.metric("Universo", f"{m['universo']:,}".replace(",", "."))
 c2.metric("Registrados", f"{m['registrados']:,}".replace(",", "."), f"{m['pct_registrados']:.1f}% del universo")
 c3.metric("Activos", f"{m['activos']:,}".replace(",", "."), f"{m['pct_activos']:.1f}% de registrados")
 c4.metric("Full Digital", f"{m['full']:,}".replace(",", "."), f"{m['pct_full']:.1f}% de activos")
-c5.metric("Venta digital", f"{m['pct_digital']:.2f}%", f"{fmt_money(m['venta_digital'])}")
+c5.metric("Avance MN", f"{m['pct_digital']:.2f}%", "Sell Out ($) Mi Negocio / Sell Out ($)", delta_color="off")
 
 c6, c7, c8 = st.columns(3)
 c6.metric("🔴 Faltan registrar", f"{m['faltan_registrar']:,}".replace(",", "."))
 c7.metric("Venta acumulada", fmt_money(m["venta_total"]))
-c8.metric("Venta Mi Negocio", fmt_money(m["venta_digital"]))
+c8.metric("Venta acumulada MN", fmt_money(m["venta_digital"]))
 
 st.divider()
 
@@ -678,10 +771,10 @@ with left:
 
 with right:
     ventas = pd.DataFrame({
-        "Tipo": ["Mi Negocio", "Resto"],
+        "Tipo": ["Venta acumulada MN", "Resto"],
         "Venta": [m["venta_digital"], max(m["venta_total"] - m["venta_digital"], 0)],
     })
-    fig2 = px.pie(ventas, names="Tipo", values="Venta", hole=.62, title="Participación de venta digital")
+    fig2 = px.pie(ventas, names="Tipo", values="Venta", hole=.62, title=f"Avance MN sobre venta acumulada · {m['pct_digital']:.2f}%")
     fig2.update_layout(margin=dict(l=20, r=20, t=55, b=20), height=360)
     st.plotly_chart(fig2, use_container_width=True)
 
@@ -699,6 +792,10 @@ if opportunities is not None:
     if day_sel != "Todos":
         opp_view = opp_view[opp_view["Día de ruta"].astype(str) == day_sel]
 
+    if ruta_dia is not None:
+        opp_view = opp_view[opp_view["Código cliente"].isin(ruta_dia["ClienteCodigo"])]
+    if buscar.strip():
+        opp_view = opp_view[opp_view["Cliente"].str.contains(buscar.strip(), case=False, na=False, regex=False)]
     r1, r2, r3, r4, r5 = st.columns(5)
     r1.metric("Registrar", int((opp_view["Accion"] == "Registrar").sum()))
     r2.metric("Activar", int((opp_view["Accion"] == "Activar").sum()))
@@ -715,14 +812,16 @@ if opportunities is not None:
             hide_index=True,
             column_config={
                 "Venta acumulada": st.column_config.NumberColumn(format="$ %.0f"),
-                "Sell Out Digital": st.column_config.NumberColumn(format="$ %.0f"),
+                "Venta acumulada MN": st.column_config.NumberColumn(format="$ %.0f"),
             },
         )
 
     st.subheader("Resumen por ruta")
     st.dataframe(build_route_summary(opp_view), use_container_width=True, hide_index=True)
 
-    export_route = opportunities_excel(opportunities)
+    if ruta_dia is not None:
+        opp_view = opp_view[opp_view["Código cliente"].isin(ruta_dia["ClienteCodigo"])]
+    export_route = opportunities_excel(opp_view)
     st.download_button(
         "Descargar oportunidades por vendedor y ruta",
         export_route,
@@ -741,8 +840,16 @@ rename = {
     "Vendedor Codigo-Nombre": "Vendedor",
     "Cliente Codigo Nombre": "Cliente",
     "Sell Out ($)": "Venta acumulada",
-    "Sell Out ($) Mi Negocio": "Venta digital",
+    "Sell Out ($) Mi Negocio": "Venta acumulada MN",
 }
+
+if ruta_dia is not None:
+    def en_ruta(data):
+        metadata = ["Secuencia", "Direccion", "Localidad", "GPS"]
+        return data.merge(ruta_dia[["ClienteCodigo"] + metadata], on="ClienteCodigo", how="inner").sort_values(["Vendedor Codigo-Nombre", "Secuencia"], na_position="last")
+    sin_reg, reg_no_act, act_no_full = (en_ruta(x) for x in (sin_reg, reg_no_act, act_no_full))
+    show_cols = ["Secuencia"] + show_cols + ["Direccion", "Localidad", "GPS"]
+    rename["Direccion"] = "Dirección"
 
 st.subheader("🎯 Oportunidades por estado")
 t1, t2, t3 = st.tabs([
@@ -754,6 +861,14 @@ for tab, data in [(t1, sin_reg), (t2, reg_no_act), (t3, act_no_full)]:
     with tab:
         view = data[show_cols].rename(columns=rename).copy()
         st.dataframe(view, use_container_width=True, hide_index=True)
+
+opp_sheets = {name: data[show_cols].rename(columns=rename) for name, data in [
+    ("Sin registrar", sin_reg), ("Registrados no activos", reg_no_act), ("Activos no Full Digital", act_no_full),
+]}
+opp_sheets["Ranking vendedores"] = vendedor_summary(df)
+export_name = f"oportunidades_ruta_{day_sel}_{fecha_actual:%Y-%m-%d}.xlsx" if ruta_dia is not None else "seguimiento_mi_negocio.xlsx"
+export_label = f"Descargar oportunidades de la ruta del {day_sel}" if ruta_dia is not None else "Descargar oportunidades en Excel"
+st.download_button(export_label, to_excel_bytes(opp_sheets), file_name=export_name, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 if vendedor_sel == "Todos":
     st.subheader("🏆 Ranking por vendedor")
@@ -783,3 +898,5 @@ st.caption(
     "El reporte diario se guarda en Supabase Storage. "
     "El maestro de clientes se sincroniza con Supabase DB y se usa para armar las oportunidades por vendedor y día de ruta."
 )
+
+
