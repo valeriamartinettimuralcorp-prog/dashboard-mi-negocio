@@ -152,6 +152,13 @@ def load_excel(file_bytes: bytes) -> pd.DataFrame:
     df["Cliente Codigo Nombre"] = df["Cliente Codigo Nombre"].fillna("Sin nombre").astype(str).str.strip()
     code_src = next((c for c in df.columns if norm(c) == "cliente codigo"), "Cliente Codigo Nombre")
     df["ClienteCodigo"] = pd.to_numeric(norm_code(df[code_src]), errors="coerce").astype("Int64")
+    # Las filas de resumen pueden tener importes pero no un cliente identificable.
+    # Nunca deben participar en las sumas, aunque el rótulo Total esté en otra columna.
+    valid_cliente = df["ClienteCodigo"].notna() & df["ClienteCodigo"].gt(0)
+    df = df.loc[valid_cliente].copy()
+    if df.empty:
+        raise ValueError("No se encontraron filas con un código de cliente válido.")
+
     df["VendedorCodigo"] = (
         df["Vendedor Codigo-Nombre"]
         .astype(str)
